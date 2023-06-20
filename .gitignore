@@ -1,0 +1,19 @@
+# npm
+node_modules
+dist
+*.log
+
+# Visual Studio & Visual Studio Code
+.cache
+.history
+.vs
+.vscode
+.ccls-cache
+*.sdf
+*.opensdf
+*.VC.opendb
+*.suo
+*.user
+
+# macOS
+.DS_Store

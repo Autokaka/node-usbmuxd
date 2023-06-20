@@ -1,0 +1,25 @@
+{
+  "name": "node-usbmuxd",
+  "version": "1.0.0",
+  "description": "Pure NodeJS implementation of usbmuxd.",
+  "main": "src/index.ts",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [
+    "darwin",
+    "usbmuxd",
+    "nodejs"
+  ],
+  "author": "Autokaka",
+  "license": "ISC",
+  "engineStrict": true,
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^14.0.0",
+    "typescript": "latest"
+  }
+}
