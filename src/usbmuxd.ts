@@ -1,23 +1,13 @@
 // Created by Autokaka (qq1909698494@gmail.com) on 2023/06/20.
 
+import { Socket, createConnection } from "net";
 import { UsbmuxdErrno } from "./usbmuxd_errno";
-
-const PACKAGE = "libusbmuxd";
-
-let _log_level_limit = 0;
-const _listener_map = new Map<usbmuxd_subscription_context_t, usbmuxd_subscription_context>();
-const _devices: usbmuxd_device_info_t[] = [];
-
-function LIBUSBMUXD_DEBUG(level: number, ...args: unknown[]): void {
-  if (level <= _log_level_limit) {
-    console.error(`[${PACKAGE}]`, ...args);
-  }
-}
-function LIBUSBMUXD_ERROR(...args: unknown[]): void {
-  LIBUSBMUXD_DEBUG(0, ...args);
-}
-
-let _watching = false;
+import { USBMUXD_SOCKET_FILE, usbmuxd_result } from "usbmuxd_proto";
+import { isNumber, isRecord, isString } from "private/type_guard";
+import { PlistObject } from "plist";
+import { usbmuxd_header } from "usbmuxd_proto";
+import { usbmuxd_msgtype } from "usbmuxd_proto";
+import plist = require("plist");
 
 /** Device lookup options for usbmuxd_get_device. */
 export enum usbmux_lookup_options {
@@ -73,11 +63,9 @@ export type usbmuxd_event_cb_t = (event: usbmuxd_event_t, user_data: ArrayBuffer
 /**
  * Subscription context type.
  */
-export type usbmuxd_subscription_context_t = Record<PropertyKey, never>; /** usbmuxd_subscription_context */
-type usbmuxd_subscription_context = {
-  callback: usbmuxd_event_cb_t;
-  user_data: ArrayBuffer;
-};
+export type usbmuxd_subscription_context_t = Record<PropertyKey, never>;
+
+export type usbmuxd_socket_fd_t = Record<PropertyKey, never>;
 
 /**
  * Subscribe a callback function to be called upon device add/remove events.
@@ -137,10 +125,114 @@ export function usbmuxd_events_unsubscribe(context: usbmuxd_subscription_context
  * @return array of attached devices, zero on no devices, or negative number
  *      if an error occured.
  */
-export function usbmuxd_get_device_list(): usbmuxd_device_info_t[] | number {
-  // Try to make socket connection.
-  // Tray to get connected devices.
-  throw new Error();
+export async function usbmuxd_get_device_list(): Promise<usbmuxd_device_info_t[] | number> {
+  return new Promise((resolve) => {
+    const __func__ = "usbmuxd_get_device_list";
+
+    let sfd: Socket | number;
+    let tag = 0;
+
+    const connect_and_list_devices = async (): Promise<void> => {
+      sfd = await connect_usbmuxd_socket();
+      if (isNumber(sfd)) {
+        console.assert(sfd < 0);
+        LIBUSBMUXD_DEBUG(1, `${__func__}: error opening socket!`);
+        resolve(sfd);
+        return;
+      }
+
+      // proto_version conformed, just list devices
+      tag = ++_use_tag;
+      if (_proto_version == 1) {
+        const lsdev_result = await socket_list_devices(sfd, tag);
+        if (isNumber(lsdev_result)) {
+          if (lsdev_result == usbmuxd_result.RESULT_BADVERSION) {
+            _proto_version = 0;
+          }
+          sfd.destroy();
+          await connect_and_list_devices();
+          return;
+        }
+
+        const plist_devlist = lsdev_result.DeviceList;
+        const device_list: usbmuxd_device_info_t[] = [];
+        if (plist_devlist instanceof Array /** PlistArray */) {
+          for (const plistdev of plist_devlist) {
+            console.assert(isRecord(plistdev));
+            const plist_devrecord = plistdev as PlistObject;
+            const device_info = device_info_from_plist(plist_devrecord);
+            if (!device_info) {
+              sfd.destroy();
+              LIBUSBMUXD_DEBUG(1, `${__func__}: Could not create device info object from properties!`);
+              resolve(-UsbmuxdErrno.EPERM);
+              return;
+            }
+            device_list.push(device_info);
+          }
+        }
+
+        // preserve & resolve device_list
+        sfd.destroy();
+        _devices.splice(0);
+        _devices.push(...device_list);
+        resolve(device_list);
+        return;
+      }
+
+      // proto_version unknown, connect & recursively list devices
+      tag = ++_use_tag;
+      const listen_result = await socket_listen(sfd, tag);
+      if (isNumber(listen_result)) {
+        sfd.destroy();
+        if (listen_result == usbmuxd_result.RESULT_BADVERSION && _proto_version == 1) {
+          _proto_version = 0;
+          await connect_and_list_devices();
+          return;
+        }
+        LIBUSBMUXD_DEBUG(1, `${__func__}: Could not listen to socket events!`);
+        resolve(listen_result);
+        return;
+      }
+
+      const device_list: usbmuxd_device_info_t[] = [];
+      const recursively_get_device_list = async (sfd: Socket): Promise<void> => {
+        const data = await socket_receive_data(sfd, 100);
+        if (isNumber(data)) {
+          // we _should_ have all of them now.
+          // or perhaps an error occurred.
+          // preserve & resolve device_list.
+          sfd.destroy();
+          _devices.splice(0);
+          _devices.push(...device_list);
+          resolve(device_list);
+          return;
+        }
+
+        const [header, body] = data;
+        if (header.message == usbmuxd_msgtype.MESSAGE_DEVICE_ADD) {
+          const device_info = device_info_from_data(body);
+          if (device_info) {
+            _devices.push(device_info);
+          } else {
+            LIBUSBMUXD_DEBUG(1, `${__func__}: Could not create device info object from raw data!`);
+          }
+        } else if (header.message == usbmuxd_msgtype.MESSAGE_DEVICE_REMOVE) {
+          const handle = new DataView(body).getUint32(0);
+          for (let i = 0; i < device_list.length; ++i) {
+            const device = device_list[i];
+            if (device.handle == handle) {
+              device_list.splice(i, 1);
+              break;
+            }
+          }
+        } else {
+          LIBUSBMUXD_DEBUG(1, `${__func__}: Unexpected message ${header.message}`);
+        }
+      };
+      await recursively_get_device_list(sfd);
+    };
+    connect_and_list_devices();
+  });
 }
 
 /**
@@ -320,3 +412,182 @@ export function usbmuxd_delete_pair_record(record_id: string): number {
 }
 
 export function libusbmuxd_set_debug_level(level: number): void {}
+
+/////////////////////////////////////////////////////////////////////////////////
+// Private //////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////
+
+const PACKAGE = "libusbmuxd";
+const PLIST_LIBUSBMUX_VERSION = 3;
+
+type usbmuxd_subscription_context = {
+  callback: usbmuxd_event_cb_t;
+  user_data: ArrayBuffer;
+};
+
+let _log_level_limit = 0;
+let _watching = false;
+let _use_tag = 0;
+let _proto_version = 1;
+
+const _listener_map = new Map<usbmuxd_subscription_context_t, usbmuxd_subscription_context>();
+const _devices: usbmuxd_device_info_t[] = [];
+
+function LIBUSBMUXD_DEBUG(level: number, ...args: unknown[]): void {
+  if (level <= _log_level_limit) {
+    console.error(`[${PACKAGE}]`, ...args);
+  }
+}
+
+function LIBUSBMUXD_ERROR(...args: unknown[]): void {
+  LIBUSBMUXD_DEBUG(0, ...args);
+}
+
+const _sfd_map = new Map<usbmuxd_socket_fd_t, Socket>();
+function connect_usbmuxd_socket(): Promise<Socket | number> {
+  return new Promise((resolve) => {
+    const socket = createConnection(USBMUXD_SOCKET_FILE);
+    socket.addListener("connect", () => {
+      socket.removeAllListeners();
+      resolve(socket);
+    });
+    socket.addListener("error", () => {
+      resolve(-UsbmuxdErrno.ENOENT);
+    });
+  });
+}
+
+function socket_list_devices(sfd: Socket, tag: number): Promise<PlistObject | number> {
+  return socket_send_plist(sfd, tag, create_plist_message("ListDevices")) as Promise<PlistObject | number>;
+}
+
+async function socket_listen(sfd: Socket, tag: number): Promise<void | number> {
+  if (_proto_version == 1) {
+    /* construct message plist */
+    return socket_send_plist(sfd, tag, create_plist_message("Listen")) as Promise<void | number>;
+  } else {
+    /* binary packet */
+    return socket_send_data(sfd, usbmuxd_msgtype.MESSAGE_LISTEN, tag) as Promise<void | number>;
+  }
+}
+
+async function socket_send_plist(sfd: Socket, tag: number, plist_object: PlistObject): Promise<void | PlistObject | number> {
+  const data = new TextEncoder().encode(plist.build(plist_object));
+  const result = await socket_send_data(sfd, usbmuxd_msgtype.MESSAGE_PLIST, tag, data.buffer);
+  if (result instanceof ArrayBuffer) {
+    return plist.parse(new TextDecoder().decode(result)) as PlistObject;
+  }
+  return result;
+}
+
+function socket_send_data(sfd: Socket, message: usbmuxd_msgtype, tag: number, data?: ArrayBuffer): Promise<void | ArrayBuffer | number> {
+  const __func__ = "socket_send_data";
+  const socket_send_raw_data = (data: Uint8Array): Promise<boolean> => {
+    return new Promise((resolve) => {
+      const success = sfd.write(data, (error) => {
+        if (success) {
+          resolve(error === undefined);
+        }
+      });
+      if (!success) {
+        resolve(false);
+      }
+    });
+  };
+  return new Promise(async (resolve) => {
+    const header_byte_length = 4 /** uint32_t */ * 4;
+    const data_byte_length = data?.byteLength ?? 0;
+    const header: usbmuxd_header = {
+      length: header_byte_length + data_byte_length,
+      version: _proto_version,
+      message,
+      tag,
+    };
+    const header_data = new Uint8Array(header_byte_length);
+    const header_view = new DataView(header_data.buffer);
+    header_view.setUint32(0, header.length);
+    header_view.setUint32(4, header.version);
+    header_view.setUint32(8, header.message);
+    header_view.setUint32(12, header.tag);
+    const header_sent = await socket_send_raw_data(header_data);
+    if (!header_sent) {
+      LIBUSBMUXD_DEBUG(1, `${__func__}: ERROR: could not send packet header!`);
+      resolve(-UsbmuxdErrno.EPERM);
+      return;
+    }
+
+    if (data && data.byteLength > 0) {
+      const data_sent = await socket_send_raw_data(new Uint8Array(data));
+      if (!data_sent) {
+        LIBUSBMUXD_DEBUG(1, `${__func__}: ERROR: could not send whole packet!`);
+        sfd.destroy();
+        resolve(-UsbmuxdErrno.EPERM);
+        return;
+      }
+    }
+
+    const on_data_received = (recv_data: Uint8Array) => {
+      sfd.removeListener("data", on_data_received);
+      resolve(/** TODO(Autokaka): resolve() or resolve(ArrayBuffer) */);
+    };
+    sfd.addListener("data", on_data_received);
+  });
+}
+
+async function socket_receive_data(sfd: Socket, timeout = 0): Promise<[usbmuxd_header, ArrayBuffer] | number> {
+  throw new Error();
+}
+
+function create_plist_message(message_type: string): PlistObject {
+  return plist.parse(`<?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0">
+    <key>ClientVersionString</key>
+    <string>${PACKAGE}</string>
+    <key>MessageType</key>
+    <string>${message_type}</string>
+    <key>kLibUSBMuxVersion</key>
+    <string>${PLIST_LIBUSBMUX_VERSION}</string>
+  </plist>`) as PlistObject;
+}
+
+function device_info_from_plist(props: PlistObject): usbmuxd_device_info_t | undefined {
+  const __func__ = "device_info_from_plist";
+  const { DeviceID, ProductID, SerialNumber, ConnectionType, NetworkAddress } = props;
+  let success = true;
+  if (!isNumber(DeviceID)) {
+    LIBUSBMUXD_ERROR(`${__func__}: Failed to get DeviceID!`);
+    success = false;
+  }
+  if (!isNumber(ProductID)) {
+    LIBUSBMUXD_ERROR(`${__func__}: Failed to get ProductID!`);
+    success = false;
+  }
+  if (!isString(SerialNumber)) {
+    LIBUSBMUXD_ERROR(`${__func__}: Failed to get SerialNumber!`);
+    success = false;
+  }
+  if (ConnectionType !== "USB" && ConnectionType !== "Network") {
+    LIBUSBMUXD_ERROR(`${__func__}: Unexpected ConnectionType!`);
+    success = false;
+  }
+  if (ConnectionType === "Network" && !(NetworkAddress instanceof Uint8Array)) {
+    LIBUSBMUXD_ERROR(`${__func__}: Failed to get NetworkAddress!`);
+    success = false;
+  }
+  if (!success) {
+    return undefined;
+  }
+  const device_info: usbmuxd_device_info_t = {
+    handle: DeviceID as number,
+    product_id: ProductID as number,
+    udid: SerialNumber as string,
+    conn_type: ConnectionType == "Network" ? usbmux_connection_type.CONNECTION_TYPE_NETWORK : usbmux_connection_type.CONNECTION_TYPE_USB,
+    conn_data: ConnectionType == "Network" ? (NetworkAddress as Uint8Array) : new Uint8Array(),
+  };
+  return device_info;
+}
+
+function device_info_from_data(data: ArrayBuffer): usbmuxd_device_info_t | undefined {
+  throw new Error();
+}
